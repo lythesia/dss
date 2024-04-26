@@ -59,7 +59,7 @@ impl Storage {
 fn init_logger() {
     use std::sync::Once;
     static LOGGER_INIT: Once = Once::new();
-    LOGGER_INIT.call_once(env_logger::init);
+    LOGGER_INIT.call_once(|| env_logger::builder().format_timestamp_millis().init());
 }
 
 pub struct Config {
@@ -456,8 +456,10 @@ impl Config {
         self.net.spawn_poller(apply);
 
         let mut builder = labrpc::ServerBuilder::new(format!("{}", i));
+        // node as rpc server
         raft::add_raft_service(node, &mut builder).unwrap();
         let srv = builder.build();
+        // add rpc server to net framework
         self.net.add_server(srv);
     }
 
@@ -511,6 +513,9 @@ impl Config {
             if *connected {
                 let endname = &*self.endnames[i][j];
                 self.net.enable(endname, true);
+                // when 0: eps[0][0] enable
+                // when 1: eps[1][0,1] enable
+                // when 2: eps[2][0,1,2] enable
             }
         }
 
@@ -519,8 +524,12 @@ impl Config {
             if *connected {
                 let endname = &*self.endnames[j][i];
                 self.net.enable(endname, true);
+                // when 0: eps[0][0] enable
+                // when 1: eps[0,1][1] enable
+                // when 2: eps[0,1,2][2] enable
             }
         }
+        // so all 0,1,2 able to access each other
     }
 }
 

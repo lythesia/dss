@@ -6,7 +6,7 @@ authors = [
     "ShuNing <nolouch@gmail.com>",
     "Connor <zbk602423539@gmail.com>",
     "庄天翼 <zty0826@gmail.com>",
-    "MIT 6.824 <6824-staff@lists.csail.mit.edu>"
+    "MIT 6.824 <6824-staff@lists.csail.mit.edu>",
 ]
 edition = "2018"
 publish = false
@@ -22,7 +22,9 @@ rand = "0.7"
 
 labcodec = { path = "../labcodec" }
 labrpc = { path = "../labrpc" }
-linearizability = { path = "../linearizability"}
+linearizability = { path = "../linearizability" }
+atomic_enum = "0.3.0"
+educe = { version = "0.5.11", features = ["Debug"] }
 
 [dev-dependencies]
 env_logger = "0.7"

@@ -3,7 +3,9 @@ use std::fmt;
 use crate::proto::kvraftpb::*;
 
 enum Op {
+    #[allow(dead_code)]
     Put(String, String),
+    #[allow(dead_code)]
     Append(String, String),
 }
 

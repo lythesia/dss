@@ -31,6 +31,7 @@ struct Endpoints {
     // servers, by name
     servers: HashMap<String, Option<Server>>,
     // client_name -> server_name
+    // client can access to server
     connections: HashMap<String, Option<String>>,
 }
 
