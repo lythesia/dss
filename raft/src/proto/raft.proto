@@ -7,6 +7,8 @@ message RequestVoteArgs {
     // Your data here (2A, 2B).
     uint64 term = 1;
     uint64 candidate = 2;
+    uint64 last_log_index = 3;
+    uint64 last_log_term = 4;
 }
 
 // Example RequestVote RPC reply structure.
@@ -19,9 +21,21 @@ message RequestVoteReply {
 message AppendEntriesArgs {
     uint64 term = 1;
     uint64 leader = 2;
+    uint64 prev_log_index = 3;
+    uint64 prev_log_term = 4;
+    repeated LogEntry entries = 5;
+    uint64 leader_commit = 6;
 }
 
 message AppendEntriesReply {
     uint64 term = 1;
     bool success = 2;
+    uint64 conflict_log_index = 3;
+    uint64 conflict_log_term = 4;
+}
+
+message LogEntry {
+    uint64 term = 1;
+    uint64 index = 2;
+    bytes command = 3;
 }
