@@ -41,6 +41,43 @@ pub enum ApplyMsg {
     },
 }
 
+/*
+message PersistedState {
+    uint64 current_term = 1;
+    optional uint64 voted_for = 2;
+    repeated LogEntry log = 3;
+    uint64 snapshot_last_index = 4;
+    uint64 snapshot_last_term = 5;
+}
+*/
+#[derive(Clone, Message)]
+struct PersistedState {
+    #[prost(uint64, tag = "1")]
+    pub current_term: u64,
+    #[prost(uint64, optional, tag = "2")]
+    pub voted_for: Option<u64>,
+    #[prost(message, repeated, tag = "3")]
+    pub log: Vec<LogEntry>,
+    #[prost(uint64, tag = "4")]
+    pub snapshot_last_index: u64,
+    #[prost(uint64, tag = "5")]
+    pub snapshot_last_term: u64,
+}
+
+impl std::fmt::Display for PersistedState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let log_range = match (self.log.get(1), self.log.last()) {
+            (Some(e), Some(last)) => e.index..=last.index,
+            _ => 0..=0,
+        };
+        write!(
+            f,
+            "current_term={}, voted_for={:?}, log=[{:?}]",
+            self.current_term, self.voted_for, log_range
+        )
+    }
+}
+
 /// State of a raft peer.
 #[derive(Default, Clone, Debug)]
 pub struct State {
@@ -225,12 +262,24 @@ impl Raft {
         // labcodec::encode(&self.xxx, &mut data).unwrap();
         // labcodec::encode(&self.yyy, &mut data).unwrap();
         // self.persister.save_raft_state(data);
+        let state = PersistedState {
+            current_term: self.term.load(Ordering::SeqCst),
+            voted_for: self.voted_for.map(|v| v as u64),
+            log: self.log.clone(),
+            snapshot_last_index: 0,
+            snapshot_last_term: 0,
+        };
+        let mut buf = Vec::new();
+        labcodec::encode(&state, &mut buf).unwrap();
+        self.persister.save_raft_state(buf);
+        info!("{self} persisted: {state}");
     }
 
     /// restore previously persisted state.
     fn restore(&mut self, data: &[u8]) {
         if data.is_empty() {
             // bootstrap without any state?
+            return;
         }
         // Your code here (2C).
         // Example:
@@ -243,6 +292,15 @@ impl Raft {
         //         panic!("{:?}", e);
         //     }
         // }
+        match labcodec::decode::<PersistedState>(data) {
+            Ok(o) => {
+                self.term.store(o.current_term, Ordering::SeqCst);
+                self.voted_for = o.voted_for.map(|v| v as usize);
+                self.log = o.log;
+                // todo: snapshot?
+            }
+            Err(e) => panic!("{:?}", e),
+        }
     }
 
     /// example code to send a RequestVote RPC to a server.
@@ -324,6 +382,9 @@ impl Raft {
             term,
             command,
         });
+
+        self.persist();
+
         self.next_index[self.me] = index + 1;
         self.match_index[self.me] = index;
         Ok((index as u64, term))
@@ -351,8 +412,6 @@ impl Raft {
     pub fn __suppress_deadcode(&mut self) {
         let _ = self.cond_install_snapshot(0, 0, &[]);
         self.snapshot(0, &[]);
-        self.persist();
-        let _ = &self.persister;
     }
 
     async fn run(mut self) {
@@ -392,7 +451,7 @@ impl Raft {
                 debug!(
                     "{self} send AE to RAFT-{svr}: leader_commit={}, logs[{:?}]",
                     self.commit_index,
-                    next_index..(next_index + slice.len())
+                    next_index..=(next_index + slice.len() - 1)
                 );
                 args.entries.extend_from_slice(slice);
             } else {
@@ -432,7 +491,7 @@ impl Raft {
             }
         };
 
-        debug!("{self} recv AE reply: {r:?}");
+        debug!("{self} recv AE reply from RAFT-{svr}: {r:?}");
         let term = self.term.load(Ordering::SeqCst);
         let role = self.role.load(Ordering::SeqCst);
         // term fall behind
@@ -490,7 +549,7 @@ impl Raft {
     fn leader_try_commit_and_apply(&mut self) {
         let term = self.term.load(Ordering::SeqCst);
         let majority_index = get_majority_same_index(self.match_index.clone());
-        // if term is legal
+        // MUST check if term is legal to avoid figure.8
         if self.log[majority_index].term == term && majority_index > self.commit_index {
             self.try_commit_to_and_apply(majority_index);
         }
@@ -507,9 +566,8 @@ impl Raft {
                         .event_tx
                         .unbounded_send(RaftEvent::RequestVote(args, tx));
                     return true;
-                } else {
-                    // stay
-                    let _ = tx.send(reply);
+                } else if tx.send(reply).is_err() {
+                    panic!("{} RV reply rx dropped?", self)
                 }
             }
             RaftEvent::AppendEntriesReply {
@@ -523,7 +581,9 @@ impl Raft {
             }
             RaftEvent::StartCommand(buf, tx) => {
                 let reply = self.start(buf);
-                let _ = tx.send(reply);
+                if tx.send(reply).is_err() {
+                    panic!("{} StartCommand reply rx dropped?", self);
+                }
             }
             RaftEvent::Kill => {
                 debug!("{self} kill signal!");
@@ -596,10 +656,12 @@ impl Raft {
                     if self.is_up_to_date(args.last_log_term, args.last_log_index) {
                         debug!("{self} grant vote (more up-to-date): {args:?}");
                         self.voted_for = Some(args.candidate as usize);
+                        self.persist();
                         (granted, false)
                     } else {
                         debug!("{self} reject vote (less up-to-date): {args:?}");
                         self.voted_for = None;
+                        self.persist();
                         (rejected, false)
                     }
                 } else {
@@ -634,6 +696,7 @@ impl Raft {
         match args.term.cmp(&curr_term) {
             cmp::Ordering::Greater => {
                 self.voted_for = None; // admit this leader, todo: do we need to remember leader_id?
+                self.persist();
                 let _not_used = judging;
                 (_not_used, true) // reenter with higher term (actually goto branch `Ordering::Equal`)
             }
@@ -670,16 +733,14 @@ impl Raft {
                             let start_index = args.prev_log_index as usize + 1;
                             if !args.entries.is_empty() {
                                 debug!(
-                                    "{self} copy to logs[{:?}](while self.len={})",
-                                    start_index..(start_index + args.entries.len()),
-                                    self.log.len(),
+                                    "{self} copy to logs[{:?}](while self.last={})",
+                                    start_index..=(start_index + args.entries.len() - 1),
+                                    self.last_log().index
                                 );
                                 // keep [..start_index)
                                 self.log.truncate(start_index);
                                 // copy, todo: avoid clone by `extend_from_slice`
                                 self.log.extend_from_slice(&args.entries[..]);
-                                // always hold because log extented
-                                assert!(self.last_log().index as usize > self.commit_index);
                             } else {
                                 // heartbeat
                                 // heartbeat rpc has also prev_log_index/term, to ensure & track followers' progress
@@ -690,7 +751,7 @@ impl Raft {
                                 if start_index <= self.log.len() {
                                     debug!(
                                         "{self} reply heartbeat with logs[{:?}] truncated",
-                                        start_index..self.log.len()
+                                        start_index..=(self.log.len() - 1)
                                     );
                                 } else {
                                     debug!("{self} reply heartbeat");
@@ -698,6 +759,7 @@ impl Raft {
                                 self.log.truncate(start_index);
                                 // heartbeat may also contain latest leader commit_index, so still need try to apply
                             }
+                            self.persist();
 
                             // try update commit index
                             if args.leader_commit as usize > self.commit_index {
@@ -725,9 +787,8 @@ impl Raft {
                         .event_tx
                         .unbounded_send(RaftEvent::RequestVote(args, tx));
                     return true;
-                } else {
-                    // stay
-                    let _ = tx.send(reply);
+                } else if tx.send(reply).is_err() {
+                    panic!("{} RV reply rx dropped?", self);
                 }
             }
             RaftEvent::AppendEntries(args, tx) => {
@@ -739,8 +800,8 @@ impl Raft {
                         .event_tx
                         .unbounded_send(RaftEvent::AppendEntries(args, tx));
                     return true;
-                } else {
-                    let _ = tx.send(reply);
+                } else if tx.send(reply).is_err() {
+                    panic!("{} AE reply rx dropped?", self);
                 }
                 // reset timer if it's legal AE from current leader
                 // todo: refactor this
@@ -752,7 +813,9 @@ impl Raft {
             }
             RaftEvent::StartCommand(buf, tx) => {
                 let reply = self.start(buf);
-                let _ = tx.send(reply);
+                if tx.send(reply).is_err() {
+                    panic!("{} StartCommand reply rx dropped?", self);
+                }
             }
             RaftEvent::Kill => {
                 debug!("{self} kill signal!");
@@ -867,9 +930,8 @@ impl Raft {
                         .event_tx
                         .unbounded_send(RaftEvent::RequestVote(args, tx));
                     return true;
-                } else {
-                    // stay
-                    let _ = tx.send(reply);
+                } else if tx.send(reply).is_err() {
+                    panic!("{} RV reply rx dropped?", self);
                 }
             }
             RaftEvent::RequestVoteReply { svr, result } => {
@@ -915,14 +977,15 @@ impl Raft {
                         .event_tx
                         .unbounded_send(RaftEvent::AppendEntries(args, tx));
                     return true;
-                } else {
-                    // stay
-                    let _ = tx.send(reply);
+                } else if tx.send(reply).is_err() {
+                    panic!("{} AE reply rx dropped?", self);
                 }
             }
             RaftEvent::StartCommand(buf, tx) => {
                 let reply = self.start(buf);
-                let _ = tx.send(reply);
+                if tx.send(reply).is_err() {
+                    panic!("{} StartCommand reply rx dropped?", self);
+                }
             }
             RaftEvent::Kill => {
                 debug!("{self} kill signal!");
@@ -973,6 +1036,7 @@ impl Raft {
         self.term.fetch_add(1, Ordering::SeqCst);
         self.role.store(RaftRole::Candidate, Ordering::SeqCst);
         self.voted_for = Some(self.me);
+        self.persist();
     }
 
     fn become_follower(&mut self, term: u64, voted_for: Option<usize>) {
@@ -980,6 +1044,7 @@ impl Raft {
         self.term.store(term, Ordering::SeqCst);
         self.role.store(RaftRole::Follower, Ordering::SeqCst);
         self.voted_for = voted_for;
+        self.persist();
     }
 
     fn become_leader(&mut self) {
@@ -987,6 +1052,7 @@ impl Raft {
         info!("{self} => LDR[{term}]");
         self.role.store(RaftRole::Leader, Ordering::SeqCst);
         self.voted_for = None;
+        self.persist();
         let last_log_index = self.last_log().index as usize;
         // init index when becoming leader, me index also changed
         for svr in 0..self.peers.len() {
@@ -1025,18 +1091,26 @@ impl Raft {
             return;
         }
 
+        // #[derive(Message)]
+        // pub struct Entry {
+        //     #[prost(uint64, tag = "100")]
+        //     pub x: u64,
+        // }
+
         assert!(self.last_applied < self.log.len());
-        let start = self.last_applied + 1;
-        let apply_msgs = self
-            .log
+        let from = self.last_applied + 1;
+        let apply_msgs = self.log[from..=to]
             .iter()
-            .skip(start)
+            // .inspect(|e| {
+            //     let cmd = labcodec::decode::<Entry>(&e.command).unwrap();
+            //     debug!("{self} apply logs[{}]: {cmd:?}", e.index);
+            // })
             .map(|e| ApplyMsg::Command {
                 data: e.command.clone(),
                 index: e.index,
             })
             .collect::<Vec<_>>();
-        debug!("{self} apply logs[{:?}]", start..(start + apply_msgs.len()),);
+        debug!("{self} apply logs[{:?}]", from..=to,);
 
         // todo: `unbound_send` or async `send_all`?
         let mut apply_ch = self.apply_ch.clone();
@@ -1129,9 +1203,17 @@ impl Node {
             .unbounded_send(RaftEvent::StartCommand(encoded, tx))
         {
             error!("RAFT-{} start failed: {e}", self.me);
+            return Err(Error::Rpc(labrpc::Error::Stopped));
         }
         info!("NODE-{} start command: {command:?}", self.me);
-        let resp = rx.recv().expect("sync sender dropped with no msg!");
+        // there's chance node get killed when wait `recv`
+        let resp = match rx.recv() {
+            Ok(v) => v,
+            Err(_) => {
+                error!("NODE-{} sync sender dropped?", self.me);
+                return Err(Error::Rpc(labrpc::Error::Stopped));
+            }
+        };
         info!("NODE-{} start command reply: {resp:?}", self.me);
         resp
     }
@@ -1169,7 +1251,7 @@ impl Node {
     pub fn kill(&self) {
         // Your code here, if desired.
         if let Err(e) = self.event_tx.unbounded_send(RaftEvent::Kill) {
-            error!("node-{} kill failed: {e}", self.me);
+            error!("NODE-{} kill failed: {e}", self.me);
         }
     }
 
