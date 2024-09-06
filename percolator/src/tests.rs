@@ -40,7 +40,7 @@ impl RpcHooks for CommitHooks {
 fn init_logger() {
     use std::sync::Once;
     static LOGGER_INIT: Once = Once::new();
-    LOGGER_INIT.call_once(env_logger::init);
+    LOGGER_INIT.call_once(|| env_logger::builder().format_timestamp_millis().init());
 }
 
 fn init(num_clinet: usize) -> (Network, Vec<Client>, Arc<CommitHooks>) {

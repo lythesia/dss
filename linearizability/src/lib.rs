@@ -30,6 +30,7 @@ struct Entry<T> {
 fn make_entries<I: Debug, O: Debug>(history: Operations<I, O>) -> Vec<Entry<Value<I, O>>> {
     let mut entries = Vec::new();
     for (id, elem) in history.into_iter().enumerate() {
+        // 每个op的call/return (input/output)变成两个entry
         entries.push(Entry {
             kind: EntryKind::CallEntry,
             value: Value::Input(elem.input),
@@ -68,7 +69,7 @@ impl<T: Debug> LinkedNodes<T> {
             nodes.push_front(match entry.kind {
                 EntryKind::CallEntry => Rc::new(RefCell::new(Node {
                     value: entry.value,
-                    matched: matches.get(&entry.id).cloned(),
+                    matched: matches.get(&entry.id).cloned(), // 只有call entry才会有match
                     id: entry.id,
                     next: None,
                     prev: None,
@@ -93,8 +94,8 @@ impl<T: Debug> LinkedNodes<T> {
     pub fn len(&self) -> usize {
         let mut len = 0;
         let mut entry = self.head.clone();
-        while let Some(e) = entry {
-            entry = e.borrow().next.clone();
+        while let Some(e) = entry.take() {
+            entry.clone_from(&e.borrow().next);
             len += 1;
         }
         len
@@ -189,16 +190,22 @@ struct CallsEntry<V: Debug, T> {
 
 fn lift<T: Debug>(entry: &LinkNode<T>) {
     let prev = Ref::map(entry.borrow(), |e| e.prev.as_ref().unwrap());
-    prev.borrow_mut().next = entry.borrow().next.clone();
+    prev.borrow_mut().next.clone_from(&entry.borrow().next);
     let next = Ref::map(entry.borrow(), |e| e.next.as_ref().unwrap());
-    next.borrow_mut().prev = entry.borrow().prev.clone();
+    next.borrow_mut().prev.clone_from(&entry.borrow().prev);
 
     let matched = Ref::map(entry.borrow(), |e| e.matched.as_ref().unwrap());
     let matched_prev = Ref::map(matched.borrow(), |e| e.prev.as_ref().unwrap());
-    matched_prev.borrow_mut().next = matched.borrow().next.clone();
+    matched_prev
+        .borrow_mut()
+        .next
+        .clone_from(&matched.borrow().next);
     if matched.borrow().next.is_some() {
         let matched_next = Ref::map(matched.borrow(), |e| e.next.as_ref().unwrap());
-        matched_next.borrow_mut().prev = matched.borrow().prev.clone();
+        matched_next
+            .borrow_mut()
+            .prev
+            .clone_from(&matched.borrow().prev);
     }
 }
 
@@ -246,12 +253,24 @@ fn check_single<M: Model>(
         let matched = entry.as_ref().unwrap().borrow().matched.clone();
         entry = if let Some(matching) = matched {
             // the return entry
+            // 模拟state从entry.input -> entry.match的output
+            // entry == call, matching == return
+            // 但是在call/return之间可能插入了其它op(比如后来的putappend, 反而先完成)
+            // 如:
+            // state = ""
+            // 0: append 0, x 0 0 y
+            // 1: append 0, x 0 2 y
+            // 1 done, state = x 0 2 y
+            // 0 done, state = x 0 2 yx 0 0 y
             let res = model.step(
                 &state,
                 entry.as_ref().unwrap().borrow().value.input(),
                 matching.borrow().value.output(),
             );
             match res {
+                // step ok
+                // 记录+cache_entry { ln_bits, state }
+                // (cache[ln_bits.hash] as vec).push(cache_entry), 同时该entry是个call
                 (true, new_state) => {
                     let mut new_linearized = linearized.clone();
                     new_linearized.set(entry.as_ref().unwrap().borrow().id);
@@ -259,6 +278,9 @@ fn check_single<M: Model>(
                         linearized: new_linearized.clone(),
                         state: new_state.clone(),
                     };
+                    // contains:
+                    // 1. cache有ln_bits.hash
+                    // 2. cache[ln_bits.hash] as vec里有这个entry_entry
                     if !cache_contains(&model, &cache, &new_cache_entry) {
                         let hash = new_linearized.hash();
                         cache.entry(hash).or_default().push(new_cache_entry);
@@ -268,7 +290,7 @@ fn check_single<M: Model>(
                         });
                         state = new_state;
                         linearized.set(entry.as_ref().unwrap().borrow().id);
-                        lift(entry.as_ref().unwrap());
+                        lift(entry.as_ref().unwrap()); // delete `entry & entry's matched` from links?
                         head_entry.borrow().next.clone()
                     } else {
                         entry.as_ref().unwrap().borrow().next.clone()
@@ -284,7 +306,8 @@ fn check_single<M: Model>(
             entry = calls_top.entry;
             state = calls_top.state;
             linearized.clear(entry.as_ref().unwrap().borrow().id);
-            unlift(entry.as_ref().unwrap());
+            // `calls_top` must have `matched`? yes
+            unlift(entry.as_ref().unwrap()); // insert `entry & entry's matched` to links?
             entry.as_ref().unwrap().borrow().next.clone()
         }
     }

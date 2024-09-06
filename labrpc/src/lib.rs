@@ -88,7 +88,7 @@ pub mod tests {
 
     fn init_logger() {
         static LOGGER_INIT: Once = Once::new();
-        LOGGER_INIT.call_once(env_logger::init);
+        LOGGER_INIT.call_once(|| env_logger::builder().format_timestamp_millis().init());
     }
 
     #[test]

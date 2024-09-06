@@ -167,7 +167,7 @@ impl Network {
         let eps = self.core.endpoints.lock().unwrap();
         let mut server = None;
         if let Some(Some(server_name)) = eps.connections.get(client_name) {
-            server = eps.servers[server_name].clone();
+            server.clone_from(&eps.servers[server_name])
         }
         EndInfo {
             enabled: eps.enabled[client_name],
@@ -209,7 +209,8 @@ impl Network {
 
                 if !reliable && (thread_rng().gen::<u64>() % 1000) < 100 {
                     // drop the request, return as if timeout
-                    Delay::new(Duration::from_secs(short_delay.unwrap())).await;
+                    // fuck @Qinxuan Chen wrongly uses `from_secs` here when refactoring
+                    Delay::new(Duration::from_millis(short_delay.unwrap())).await;
                     return Err(Error::Timeout);
                 }
 

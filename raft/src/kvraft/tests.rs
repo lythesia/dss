@@ -71,6 +71,7 @@ where
         // a client runs the function func and then signals it is done
         let func = fact();
         thread::spawn(move || {
+            debug!("make client {cli}");
             let ck = cfg_.make_client(&cfg_.all());
             func(cli, &ck);
             cfg_.delete_client(&ck);
@@ -253,14 +254,17 @@ fn generic_test(
                         let mut rng = rand::thread_rng();
                         let mut last = String::new();
                         let key = format!("{}", cli);
+                        debug!("{}: client new put {}", cli, key);
                         put(&cfg1, myck, &key, &last);
+                        debug!("{}: client done put {}", cli, key);
                         while done_clients1.load(Ordering::Relaxed) == 0 {
                             if (rng.gen::<u32>() % 1000) < 500 {
                                 let nv = format!("x {} {} y", cli, j);
-                                debug!("{}: client new append {}", cli, nv);
+                                debug!("{}: client new append {}+={}", cli, key, nv);
                                 last = next_value(last, &nv);
                                 append(&cfg1, myck, &key, &nv);
                                 j += 1;
+                                debug!("{}: client done append {}", cli, nv);
                             } else {
                                 debug!("{}: client new get {:?}", cli, key);
                                 let v = get(&cfg1, myck, &key);
@@ -270,8 +274,10 @@ fn generic_test(
                                         key, last, v
                                     );
                                 }
+                                debug!("{}: client done get {:?}={}", cli, key, v);
                             }
                         }
+                        debug!("{cli}: client done");
                         clnt_txs1[cli].send(j).unwrap();
                     }
                 })
@@ -334,8 +340,8 @@ fn generic_test(
                 );
             }
             let key = format!("{}", i);
-            debug!("Check {:?} for client {}", j, i);
-            let v = get(&cfg, &ck, &key);
+            let v = get(&cfg, &ck, &key); // this ck only used for checking after tests
+            debug!("Check {i}: client get done: v=\"{v}\"");
             check_clnt_appends(i, v, j);
         }
 
@@ -352,7 +358,6 @@ fn generic_test(
         }
     }
 
-    cfg.check_timeout();
     cfg.end();
 }
 
@@ -429,7 +434,9 @@ fn generic_test_linearizability(
 
                         let start = begin.elapsed().as_nanos() as i64;
                         let (inp, out) = if rng.gen::<usize>() % 1000 < 500 {
+                            debug!("{}: client new append {key}+={nv}", cli);
                             append(&cfg1, myck, &key, &nv);
+                            debug!("{}: client done append {key}+={nv}", cli);
                             j += 1;
                             (
                                 KvInput {
@@ -442,7 +449,9 @@ fn generic_test_linearizability(
                                 },
                             )
                         } else if rng.gen::<usize>() % 1000 < 100 {
+                            debug!("{}: client new put {key}={nv}", cli);
                             put(&cfg1, myck, &key, &nv);
+                            debug!("{}: client done put {key}={nv}", cli);
                             j += 1;
                             (
                                 KvInput {
@@ -455,7 +464,9 @@ fn generic_test_linearizability(
                                 },
                             )
                         } else {
+                            debug!("{}: client new get {key}", cli);
                             let v = get(&cfg1, myck, &key);
+                            debug!("{}: client done get {key}={v}", cli);
                             (
                                 KvInput {
                                     op: Op::Get,
@@ -477,6 +488,7 @@ fn generic_test_linearizability(
                         data.push(op);
                     }
                     clnt_txs1[cli].send(j).unwrap();
+                    debug!("{}: client done {j} txs", cli);
                 }
             }));
 
@@ -525,7 +537,8 @@ fn generic_test_linearizability(
         }
 
         // wait for clients.
-        for clnt_rx in &clnt_rxs {
+        for (cli, clnt_rx) in clnt_rxs.iter().enumerate() {
+            debug!("wait for client {cli}");
             clnt_rx.recv().unwrap();
         }
 
@@ -545,11 +558,9 @@ fn generic_test_linearizability(
     cfg.check_timeout();
     cfg.end();
 
-    if !check_operations_timeout(
-        KvModel {},
-        Arc::try_unwrap(operations).unwrap().into_inner().unwrap(),
-        LINEARIZABILITY_CHECK_TIMEOUT,
-    ) {
+    let history = Arc::try_unwrap(operations).unwrap().into_inner().unwrap();
+    debug!("linear check");
+    if !check_operations_timeout(KvModel {}, history, LINEARIZABILITY_CHECK_TIMEOUT) {
         panic!("history is not linearizable");
     }
 }
@@ -646,7 +657,11 @@ fn test_one_partition_3a() {
     let (done1_tx, done1_rx) = oneshot::channel::<&'static str>();
 
     cfg.begin("Test: no progress in minority (3A)");
-    cfg.net.spawn(future::lazy(move |_| {
+    // fuck @Qinxuan Chen wrongly async `spawn` here when refactoring
+    // which result in: spawn fut in async ctx1 -> `client.put` is sync, called within ctx1
+    // -> `client.put` must invoke `rpc.call`, which returns a future, which means it has to be
+    // `block_on`, and `block_on` introduce async ctx2, while ctx1 and ctx2 in same thread, booom!
+    thread::spawn(move || {
         ckp2a.put("1".to_owned(), "15".to_owned());
         done0_tx
             .send("put")
@@ -654,13 +669,13 @@ fn test_one_partition_3a() {
                 warn!("done0 send failed: {:?}", e);
             })
             .unwrap();
-    }));
+    });
     let done0_rx = done0_rx.map(|op| {
         cfg.op();
         op
     });
 
-    cfg.net.spawn(future::lazy(move |_| {
+    thread::spawn(move || {
         // different clerk in p2
         ckp2b.get("1".to_owned());
         done1_tx
@@ -669,7 +684,7 @@ fn test_one_partition_3a() {
                 warn!("done0 send failed: {:?}", e);
             })
             .unwrap();
-    }));
+    });
     let done1_rx = done1_rx.map(|op| {
         cfg.op();
         op

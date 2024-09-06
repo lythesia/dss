@@ -6,7 +6,7 @@ LOG_LEVEL ?= raft=info,percolator=info
 
 check:
 	cargo fmt --all -- --check
-	cargo clippy --all --tests -- -D clippy::all -A clippy::four-forward-slashes -A clippy::explicit_auto_deref
+	cargo clippy --all --tests -- -D clippy::all -A clippy::four-forward-slashes -A clippy::explicit_auto_deref -A clippy::enum_variant_names
 
 test: test_others test_2 test_3
 

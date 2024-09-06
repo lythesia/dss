@@ -27,7 +27,7 @@ struct Servers {
 fn init_logger() {
     use std::sync::Once;
     static LOGGER_INIT: Once = Once::new();
-    LOGGER_INIT.call_once(env_logger::init);
+    LOGGER_INIT.call_once(|| env_logger::builder().format_timestamp_millis().init());
 }
 
 pub struct Config {
@@ -195,10 +195,11 @@ impl Config {
         let mut ends = Vec::with_capacity(self.n);
         let mut endnames = Vec::with_capacity(self.n);
         for j in 0..self.n {
-            let name = uniqstring();
+            // let name = uniqstring();
+            let name = format!("SERVER-{j}-{}", uniqstring());
             endnames.push(name.clone());
             let cli = self.net.create_client(name.clone());
-            ends.push(KvClient::new(cli));
+            ends.push((name.clone(), KvClient::new(cli)));
             self.net.connect(&name, &format!("{}", j));
         }
 

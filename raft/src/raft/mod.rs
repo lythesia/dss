@@ -31,6 +31,7 @@ use crate::proto::raftpb::*;
 pub enum ApplyMsg {
     Command {
         data: Vec<u8>,
+        term: u64,
         index: u64,
     },
     // For 2D:
@@ -104,7 +105,7 @@ struct LogInfo {
 
 #[atomic_enum]
 #[derive(PartialEq)]
-enum RaftRole {
+pub enum RaftRole {
     Killed = 0,
     Candidate,
     Follower,
@@ -380,7 +381,7 @@ impl Raft {
         // self.persister.save_raft_state(data);
         let (state, buf) = self.state_to_persist();
         self.persister.save_raft_state(buf);
-        info!("{self} persisted: {state}");
+        debug!("{self} persisted: {state}");
     }
 
     /// restore previously persisted state.
@@ -586,7 +587,7 @@ impl Raft {
 
 impl Raft {
     async fn run(mut self) {
-        info!("{self} started");
+        debug!("{self} started");
         loop {
             match self.role.load(Ordering::SeqCst) {
                 RaftRole::Killed => break,
@@ -595,7 +596,7 @@ impl Raft {
                 RaftRole::Leader => self.run_leader().await,
             }
         }
-        info!("{self} killed");
+        debug!("{self} killed");
     }
 
     fn state_to_persist(&self) -> (PersistedState, Vec<u8>) {
@@ -715,7 +716,7 @@ impl Raft {
             }
         };
 
-        debug!("{self} recv AE reply from RAFT-{svr}: {r:?}");
+        debug!("{self} recv AE reply from RAFT-{svr}: {r:?}, last_index={last_index}");
         let term = self.term.load(Ordering::SeqCst);
         let role = self.role.load(Ordering::SeqCst);
         // term fall behind
@@ -839,6 +840,19 @@ impl Raft {
                     return true;
                 } else if tx.send(reply).is_err() {
                     panic!("{} RV reply rx dropped?", self)
+                }
+            }
+            RaftEvent::AppendEntries(args, tx) => {
+                let (reply, to_follower) = self.on_append_entries(&args);
+                if to_follower {
+                    self.become_follower(args.term, None);
+                    // resend AE, handle it when I become follower
+                    let _ = self
+                        .event_tx
+                        .unbounded_send(RaftEvent::AppendEntries(args, tx));
+                    return true;
+                } else if tx.send(reply).is_err() {
+                    panic!("{} AE reply rx dropped?", self);
                 }
             }
             RaftEvent::AppendEntriesReply {
@@ -1318,10 +1332,7 @@ impl Raft {
     }
 
     // (reply, to_follower?)
-    fn candidate_on_append_entries(
-        &mut self,
-        args: &AppendEntriesArgs,
-    ) -> (AppendEntriesReply, bool) {
+    fn on_append_entries(&mut self, args: &AppendEntriesArgs) -> (AppendEntriesReply, bool) {
         let curr_term = self.term.load(Ordering::SeqCst);
         let accepted = AppendEntriesReply {
             term: args.term,
@@ -1400,7 +1411,7 @@ impl Raft {
                 }
             }
             RaftEvent::AppendEntries(args, tx) => {
-                let (reply, to_follower) = self.candidate_on_append_entries(&args);
+                let (reply, to_follower) = self.on_append_entries(&args);
                 if to_follower {
                     self.become_follower(args.term, None);
                     // resend AE, handle it when I become follower
@@ -1490,7 +1501,7 @@ impl Raft {
 
     fn become_candidate(&mut self) {
         let term = self.term.load(Ordering::SeqCst);
-        info!("{self} => CAN[{}]", term + 1);
+        debug!("{self} => CAN[{}]", term + 1);
         self.term.fetch_add(1, Ordering::SeqCst);
         self.role.store(RaftRole::Candidate, Ordering::SeqCst);
         self.voted_for = Some(self.me);
@@ -1498,7 +1509,7 @@ impl Raft {
     }
 
     fn become_follower(&mut self, term: u64, voted_for: Option<usize>) {
-        info!("{self} => FLR[{term}]");
+        debug!("{self} => FLR[{term}]");
         self.term.store(term, Ordering::SeqCst);
         self.role.store(RaftRole::Follower, Ordering::SeqCst);
         self.voted_for = voted_for;
@@ -1507,7 +1518,7 @@ impl Raft {
 
     fn become_leader(&mut self) {
         let term = self.term.load(Ordering::SeqCst);
-        info!("{self} => LDR[{term}]");
+        debug!("{self} => LDR[{term}]");
         self.role.store(RaftRole::Leader, Ordering::SeqCst);
         self.voted_for = None;
         self.persist();
@@ -1560,6 +1571,7 @@ impl Raft {
             // })
             .map(|e| ApplyMsg::Command {
                 data: e.command.clone(),
+                term: e.term,
                 index: e.index,
             })
             .collect::<Vec<_>>();
@@ -1595,8 +1607,8 @@ pub struct Node {
     // me never change
     me: usize,
     // shared state
-    role: Arc<AtomicRaftRole>,
-    term: Arc<AtomicU64>,
+    pub(crate) role: Arc<AtomicRaftRole>,
+    pub(crate) term: Arc<AtomicU64>,
     // event chan
     event_tx: UnboundedSender<RaftEvent>,
     // executor
@@ -1658,7 +1670,7 @@ impl Node {
             error!("RAFT-{} start failed: {e}", self.me);
             return Err(Error::Rpc(labrpc::Error::Stopped));
         }
-        info!("NODE-{} start command: {command:?}", self.me);
+        debug!("NODE-{} start command: {command:?}", self.me);
         // there's chance node get killed when wait `recv`
         let resp = match rx.recv() {
             Ok(v) => v,
@@ -1667,7 +1679,7 @@ impl Node {
                 return Err(Error::Rpc(labrpc::Error::Stopped));
             }
         };
-        info!("NODE-{} start command reply: {resp:?}", self.me);
+        debug!("NODE-{} start command reply: {resp:?}", self.me);
         resp
     }
 
@@ -1735,7 +1747,7 @@ impl Node {
             return false;
         }
 
-        info!("NODE-{} cond install snapshot: last_include_index={last_included_index}, last_include_term={last_included_term}", self.me);
+        debug!("NODE-{} cond install snapshot: last_include_index={last_included_index}, last_include_term={last_included_term}", self.me);
         let ok = match rx.recv() {
             Ok(v) => v,
             Err(_) => {
@@ -1743,7 +1755,7 @@ impl Node {
                 false
             }
         };
-        info!("NODE-{} cond install snapshot result: {ok}", self.me);
+        debug!("NODE-{} cond install snapshot result: {ok}", self.me);
         ok
     }
 
