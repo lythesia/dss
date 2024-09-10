@@ -170,6 +170,7 @@ enum RaftEvent {
         #[educe(Debug(ignore))]
         tx: mpsc::SyncSender<bool>,
     },
+    StateSize(mpsc::SyncSender<usize>),
     Kill,
 }
 
@@ -839,7 +840,7 @@ impl Raft {
                         .unbounded_send(RaftEvent::RequestVote(args, tx));
                     return true;
                 } else if tx.send(reply).is_err() {
-                    panic!("{} RV reply rx dropped?", self)
+                    panic!("{} RV reply rx dropped?", self);
                 }
             }
             RaftEvent::AppendEntries(args, tx) => {
@@ -870,9 +871,6 @@ impl Raft {
                     panic!("{} StartCommand reply rx dropped?", self);
                 }
             }
-            RaftEvent::StartSnapshot { index, snapshot } => {
-                self.snapshot(index, snapshot);
-            }
             RaftEvent::InstallSnapshot(args, tx) => {
                 let (reply, to_follower) = self.on_install_snapshot(&args);
                 if to_follower {
@@ -898,25 +896,10 @@ impl Raft {
                     self.next_index[svr] = next_index_on_success;
                 }
             }
-            RaftEvent::CondInstallSnapshot {
-                last_included_index,
-                last_included_term,
-                snapshot,
-                tx,
-            } => {
-                let ok =
-                    self.cond_install_snapshot(last_included_term, last_included_index, snapshot);
-                if tx.send(ok).is_err() {
-                    panic!("{} CondInstallSnapshot reply rx dropped?", self);
+            evt => {
+                if self.on_general_event(evt) {
+                    return true;
                 }
-            }
-            RaftEvent::Kill => {
-                debug!("{self} kill signal!");
-                self.role.store(RaftRole::Killed, Ordering::SeqCst);
-                return true;
-            }
-            unknown => {
-                warn!("{self} unknown event: {unknown:?}");
             }
         }
         false
@@ -1228,9 +1211,6 @@ impl Raft {
                     panic!("{} StartCommand reply rx dropped?", self);
                 }
             }
-            RaftEvent::StartSnapshot { index, snapshot } => {
-                self.snapshot(index, snapshot);
-            }
             RaftEvent::InstallSnapshot(args, tx) => {
                 let (reply, reenter) = self.follower_on_install_snapshot(&args);
                 if reenter {
@@ -1250,25 +1230,10 @@ impl Raft {
                     *timer = Delay::new(ms).fuse();
                 }
             }
-            RaftEvent::CondInstallSnapshot {
-                last_included_index,
-                last_included_term,
-                snapshot,
-                tx,
-            } => {
-                let ok =
-                    self.cond_install_snapshot(last_included_term, last_included_index, snapshot);
-                if tx.send(ok).is_err() {
-                    panic!("{} CondInstallSnapshot reply rx dropped?", self);
+            evt => {
+                if self.on_general_event(evt) {
+                    return true;
                 }
-            }
-            RaftEvent::Kill => {
-                debug!("{self} kill signal!");
-                self.role.store(RaftRole::Killed, Ordering::SeqCst);
-                return true;
-            }
-            unknown => {
-                warn!("{self} unknown event: {unknown:?}");
             }
         }
         false
@@ -1429,9 +1394,6 @@ impl Raft {
                     panic!("{} StartCommand reply rx dropped?", self);
                 }
             }
-            RaftEvent::StartSnapshot { index, snapshot } => {
-                self.snapshot(index, snapshot);
-            }
             RaftEvent::InstallSnapshot(args, tx) => {
                 let (reply, to_follower) = self.on_install_snapshot(&args);
                 if to_follower {
@@ -1444,6 +1406,23 @@ impl Raft {
                     panic!("{} IS reply rx dropped?", self);
                 }
             }
+            evt => {
+                if self.on_general_event(evt) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    // -> break loop
+    fn on_general_event(&mut self, evt: RaftEvent) -> bool {
+        // although `RaftEvent::RequestVote` handle is same for all 3 roles, don't include it here
+        // for code readability
+        match evt {
+            RaftEvent::StartSnapshot { index, snapshot } => {
+                self.snapshot(index, snapshot);
+            }
             RaftEvent::CondInstallSnapshot {
                 last_included_index,
                 last_included_term,
@@ -1454,6 +1433,12 @@ impl Raft {
                     self.cond_install_snapshot(last_included_term, last_included_index, snapshot);
                 if tx.send(ok).is_err() {
                     panic!("{} CondInstallSnapshot reply rx dropped?", self);
+                }
+            }
+            RaftEvent::StateSize(tx) => {
+                let size = self.persister.raft_state_size();
+                if tx.send(size).is_err() {
+                    panic!("{} StateSize reply tx dropped?", self);
                 }
             }
             RaftEvent::Kill => {
@@ -1773,6 +1758,18 @@ impl Node {
         }) {
             error!("NODE-{} start snapshot failed: {e}", self.me)
         }
+    }
+
+    pub fn state_size(&self) -> Result<usize> {
+        let (tx, rx) = mpsc::sync_channel(1); // 1 == oneshot
+        if let Err(e) = self.event_tx.unbounded_send(RaftEvent::StateSize(tx)) {
+            error!("NODE-{} start state_size failed: {e}", self.me);
+            return Err(Error::Rpc(labrpc::Error::Stopped));
+        }
+        rx.recv().map_err(|_| {
+            error!("NODE-{} sync sender dropped?", self.me);
+            Error::Rpc(labrpc::Error::Stopped)
+        })
     }
 }
 

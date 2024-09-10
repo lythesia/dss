@@ -105,7 +105,7 @@ impl Config {
         let servers = self.servers.lock().unwrap();
         let mut logsize = 0;
         for save in &servers.saved {
-            let n = save.raft_state().len();
+            let n = save.raft_state_size();
             if n > logsize {
                 logsize = n;
             }
@@ -118,7 +118,7 @@ impl Config {
         let mut snapshotsize = 0;
         let servers = self.servers.lock().unwrap();
         for save in &servers.saved {
-            let n = save.snapshot().len();
+            let n = save.snapshot_size();
             if n > snapshotsize {
                 snapshotsize = n;
             }

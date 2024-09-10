@@ -9,14 +9,19 @@ use std::sync::{Arc, Mutex};
 
 pub trait Persister: Send + 'static {
     fn raft_state(&self) -> Vec<u8>;
+    fn raft_state_size(&self) -> usize;
     fn save_raft_state(&self, state: Vec<u8>);
     fn save_state_and_snapshot(&self, state: Vec<u8>, snapshot: Vec<u8>);
     fn snapshot(&self) -> Vec<u8>;
+    fn snapshot_size(&self) -> usize;
 }
 
 impl<T: ?Sized + Persister> Persister for Box<T> {
     fn raft_state(&self) -> Vec<u8> {
         (**self).raft_state()
+    }
+    fn raft_state_size(&self) -> usize {
+        (**self).raft_state_size()
     }
     fn save_raft_state(&self, state: Vec<u8>) {
         (**self).save_raft_state(state)
@@ -26,6 +31,9 @@ impl<T: ?Sized + Persister> Persister for Box<T> {
     }
     fn snapshot(&self) -> Vec<u8> {
         (**self).snapshot()
+    }
+    fn snapshot_size(&self) -> usize {
+        (**self).snapshot_size()
     }
 }
 
@@ -33,6 +41,9 @@ impl<T: ?Sized + Sync + Persister> Persister for Arc<T> {
     fn raft_state(&self) -> Vec<u8> {
         (**self).raft_state()
     }
+    fn raft_state_size(&self) -> usize {
+        (**self).raft_state_size()
+    }
     fn save_raft_state(&self, state: Vec<u8>) {
         (**self).save_raft_state(state)
     }
@@ -41,6 +52,9 @@ impl<T: ?Sized + Sync + Persister> Persister for Arc<T> {
     }
     fn snapshot(&self) -> Vec<u8> {
         (**self).snapshot()
+    }
+    fn snapshot_size(&self) -> usize {
+        (**self).snapshot_size()
     }
 }
 
@@ -65,6 +79,10 @@ impl Persister for SimplePersister {
         self.states.lock().unwrap().0.clone()
     }
 
+    fn raft_state_size(&self) -> usize {
+        self.states.lock().unwrap().0.len()
+    }
+
     fn save_raft_state(&self, state: Vec<u8>) {
         self.states.lock().unwrap().0 = state;
     }
@@ -76,6 +94,10 @@ impl Persister for SimplePersister {
 
     fn snapshot(&self) -> Vec<u8> {
         self.states.lock().unwrap().1.clone()
+    }
+
+    fn snapshot_size(&self) -> usize {
+        self.states.lock().unwrap().1.len()
     }
 }
 

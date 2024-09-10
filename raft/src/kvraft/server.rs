@@ -1,7 +1,10 @@
+use std::collections::HashMap;
+use std::iter::FromIterator;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use educe::Educe;
 use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
@@ -15,8 +18,6 @@ use crate::raft::{self, ApplyMsg, AtomicRaftRole, RaftRole};
 
 pub struct KvServer {
     pub rf: raft::Node,
-    // snapshot if log grows this big
-    maxraftstate: Option<usize>,
     // Your definitions here.
     // rx of apply_ch
     apply_ch: UnboundedReceiver<ApplyMsg>,
@@ -26,7 +27,7 @@ pub struct KvServer {
     // shared meta
     meta: KvMeta,
     // underlay store
-    kv: Arc<DashMap<String, String>>,
+    kv: Arc<ArcSwap<DashMap<String, String>>>,
     // shared for tasks
     state: Arc<SharedState>,
 }
@@ -52,9 +53,13 @@ impl std::fmt::Display for KvMeta {
 
 struct SharedState {
     // idempotent purpose
-    clerks: DashMap<String, u64>, // clerk_name -> seq
+    clerks: ArcSwap<DashMap<String, u64>>, // clerk_name -> seq
     // keep track of pending log index, index -> reply_chan_to_clerk
     index_ch: DashMap<u64, oneshot::Sender<u64>>, // u64 == term of command
+    // snapshot if log grows this big
+    maxraftstate: Option<usize>,
+    // handle to rf core
+    rf: raft::Node,
 }
 
 #[derive(Educe)]
@@ -110,6 +115,14 @@ enum ExecErr {
     Custom(String),
 }
 
+#[derive(Message)]
+struct Snapshot {
+    #[prost(map = "string,string", tag = "1")]
+    pub kv: HashMap<String, String>,
+    #[prost(map = "string,uint64", tag = "2")]
+    pub clerks: HashMap<String, u64>,
+}
+
 impl KvServer {
     pub fn new(
         servers: Vec<crate::proto::raftpb::RaftClient>,
@@ -120,31 +133,37 @@ impl KvServer {
         // You may need initialization code here.
 
         let (tx, apply_ch) = unbounded();
+        let snapshot = persister.snapshot();
         let rf = raft::Raft::new(servers, me, persister, tx);
         let rf = raft::Node::new(rf); // this runs raft instance on its own thread pool
         let (event_tx, event_rx) = unbounded();
         let role = rf.role.clone();
         let term = rf.term.clone();
+        let kv = Arc::new(ArcSwap::from_pointee(DashMap::new()));
+        let state = Arc::new(SharedState {
+            clerks: ArcSwap::from_pointee(DashMap::new()),
+            index_ch: Default::default(),
+            maxraftstate,
+            rf: rf.clone(),
+        });
+
+        let me = KvMeta { me, role, term };
+        Self::load_snapshot(&me, &state, &kv, &snapshot);
 
         Self {
             rf,
-            maxraftstate,
             apply_ch,
             event_tx,
             event_rx,
-            meta: KvMeta { me, role, term },
-            kv: Arc::new(Default::default()),
-            state: Arc::new(SharedState {
-                clerks: Default::default(),
-                index_ch: Default::default(),
-            }),
+            meta: me,
+            kv,
+            state,
         }
     }
 
     async fn run(self) {
         let Self {
             rf,
-            maxraftstate: _,
             mut apply_ch,
             event_tx,
             mut event_rx,
@@ -189,7 +208,7 @@ impl KvServer {
     async fn on_apply_msg(
         me: &KvMeta,
         state: &Arc<SharedState>,
-        kv: &Arc<DashMap<String, String>>,
+        kv: &Arc<ArcSwap<DashMap<String, String>>>,
         msg: ApplyMsg,
     ) {
         let notify = |term: u64, index: u64| {
@@ -212,7 +231,8 @@ impl KvServer {
                 };
                 log::debug!("{me} recv ApplyMsg: term={term}, index={index}, cmd={cmd:?}");
 
-                let applied_seq = match state.clerks.get(&cmd.clerk_name) {
+                let clerks = state.clerks.load();
+                let applied_seq = match clerks.get(&cmd.clerk_name) {
                     Some(v) => *v,
                     // followers apply logs too, they likely have no connected clerks
                     // but need to track them, so they can respond on future commands
@@ -233,6 +253,7 @@ impl KvServer {
                 }
 
                 // apply to kv
+                let kv = kv.load();
                 let op_log = match KvOp::from_i32(op) {
                     Some(KvOp::KvGet) => format!("get {key}"),
                     Some(KvOp::KvPut) => {
@@ -257,14 +278,74 @@ impl KvServer {
                     None => Default::default(),
                 };
                 // 注意这里update为最新seq, 否则可能重复apply
-                let prev_seq = state.clerks.insert(clerk_name.clone(), clerk_seq);
+                let prev_seq = clerks.insert(clerk_name.clone(), clerk_seq);
                 log::debug!(
                     "{me} update clerk[{clerk_name}].seq = {clerk_seq}(op: {op_log})(prev_seq={prev_seq:?}"
                 );
                 notify(term, index);
+
+                // try save snapshot
+                Self::try_save_snapshot(me, state, &kv, index);
             }
-            _ => todo!(), // ApplyMsg::Snapshot { data, term, index } => todo!(),
+            ApplyMsg::Snapshot { data, term, index } => {
+                log::debug!(
+                    "{me} recv Snapshot: term={term}, index={index}, size={}",
+                    data.len()
+                );
+                let ok = state.rf.cond_install_snapshot(term, index, &data);
+                if ok {
+                    Self::load_snapshot(me, state, kv, &data);
+                }
+            }
         }
+    }
+
+    fn try_save_snapshot(
+        me: &KvMeta,
+        state: &Arc<SharedState>,
+        kv: &Arc<DashMap<String, String>>,
+        index: u64,
+    ) {
+        let state_size = match state.rf.state_size() {
+            Ok(v) => v,
+            Err(_) => {
+                log::error!("{me} cannot get raft_state_size");
+                return;
+            }
+        };
+        if !matches!(state.maxraftstate, Some(max_size) if max_size <= state_size ) {
+            return;
+        }
+
+        let snapshot = Snapshot {
+            kv: HashMap::from_iter(DashMap::clone(kv)),
+            clerks: HashMap::from_iter(DashMap::clone(&state.clerks.load())),
+        };
+        let mut buf = Vec::new();
+        labcodec::encode(&snapshot, &mut buf).unwrap();
+        log::debug!("{me} save_snapshot to index={index}, size={}", buf.len());
+        state.rf.snapshot(index, &buf); // tell raft kvs has created snapshot
+    }
+
+    fn load_snapshot(
+        me: &KvMeta,
+        state: &Arc<SharedState>,
+        kv: &Arc<ArcSwap<DashMap<String, String>>>,
+        data: &[u8],
+    ) {
+        if data.is_empty() {
+            log::warn!("{me} empty snapshot? clear all");
+            state.clerks.load().clear();
+            kv.load().clear();
+            return;
+        }
+
+        log::debug!("{me} load_snapshot size={}", data.len());
+        let snapshot = labcodec::decode::<Snapshot>(data).unwrap();
+        let clerks_new = DashMap::from_iter(snapshot.clerks);
+        state.clerks.store(Arc::new(clerks_new));
+        let kv_new = DashMap::from_iter(snapshot.kv);
+        kv.store(Arc::new(kv_new));
     }
 
     async fn on_put_append(
@@ -311,7 +392,7 @@ impl KvServer {
         me: &KvMeta,
         rf: &raft::Node,
         state: &Arc<SharedState>,
-        kv: &Arc<DashMap<String, String>>,
+        kv: &Arc<ArcSwap<DashMap<String, String>>>,
         args: GetRequest,
         tx: oneshot::Sender<labrpc::Result<GetReply>>,
     ) {
@@ -332,7 +413,7 @@ impl KvServer {
 
         let reply = match Self::exec_command(me, rf, state, cmd).await {
             Ok(_) => {
-                let value = match kv.get(&key) {
+                let value = match kv.load().get(&key) {
                     Some(e) => e.value().clone(),
                     _ => Default::default(),
                 };
@@ -363,7 +444,11 @@ impl KvServer {
         state: &Arc<SharedState>,
         cmd: KvCommand,
     ) -> Result<(), ExecErr> {
-        let seq = *state.clerks.entry(cmd.clerk_name.clone()).or_insert(0);
+        let seq = *state
+            .clerks
+            .load()
+            .entry(cmd.clerk_name.clone())
+            .or_insert(0);
         // already processed
         if seq >= cmd.clerk_seq {
             log::debug!("{me} clerk[{}].seq={seq} already applied", cmd.clerk_name);
@@ -419,9 +504,7 @@ impl KvServer {
 impl KvServer {
     /// Only for suppressing deadcode warnings.
     #[doc(hidden)]
-    pub fn __suppress_deadcode(&mut self) {
-        let _ = &self.maxraftstate;
-    }
+    pub fn __suppress_deadcode(&mut self) {}
 }
 
 // Choose concurrency paradigm.
@@ -545,3 +628,7 @@ fn err_to_desc(e: raft::errors::Error) -> labrpc::Result<(bool, String)> {
         raft::errors::Error::NotLeader => Ok((true, "not leader".into())),
     }
 }
+
+// kvs refs:
+// https://github.com/springfieldking/mit-6.824-golabs-2018
+// https://github.com/makisevon/dss
