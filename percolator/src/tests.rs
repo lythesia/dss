@@ -10,7 +10,7 @@ use prost::Message;
 
 use crate::client::Client;
 use crate::server::{MemoryStorage, TimestampOracle};
-use crate::service::{add_transaction_service, add_tso_service, TSOClient, TransactionClient};
+use crate::service::{add_transaction_service, add_tso_service, TsoClient, TxnClient};
 
 struct CommitHooks {
     drop_req: AtomicBool,
@@ -22,6 +22,8 @@ impl RpcHooks for CommitHooks {
     fn before_dispatch(&self, fq_name: &str, req: &[u8]) -> Result<()> {
         if self.drop_req.load(Ordering::Relaxed) && fq_name == "transaction.commit" {
             let m = crate::msg::CommitRequest::decode(req).unwrap();
+            // if primary (and not cfg fail) => pass
+            // all secondary fail with "reqhook"
             if m.is_primary && !self.fail_primary.load(Ordering::Relaxed) {
                 return Ok(());
             }
@@ -30,6 +32,7 @@ impl RpcHooks for CommitHooks {
         Ok(())
     }
     fn after_dispatch(&self, fq_name: &str, resp: Result<Vec<u8>>) -> Result<Vec<u8>> {
+        // all fail with "resphook", but actually committed
         if self.drop_resp.load(Ordering::Relaxed) && fq_name == "transaction.commit" {
             return Err(Error::Other("resphook".to_owned()));
         }
@@ -70,13 +73,13 @@ fn init(num_clinet: usize) -> (Network, Vec<Client>, Arc<CommitHooks>) {
         let txn_name = txn_name_string.as_str();
         let cli = rn.create_client(txn_name.to_owned());
         cli.set_hooks(hook.clone());
-        let txn_client = TransactionClient::new(cli);
+        let txn_client = TxnClient::new(cli);
         rn.enable(txn_name, true);
         rn.connect(txn_name, server_name);
         let tso_name_string = format!("tso{}", i);
         let tso_name = tso_name_string.as_str();
         let cli = rn.create_client(tso_name.to_owned());
-        let tso_client = TSOClient::new(cli);
+        let tso_client = TsoClient::new(cli);
         rn.enable(tso_name, true);
         rn.connect(tso_name, tso_server_name);
         clients.push(crate::client::Client::new(tso_client, txn_client));

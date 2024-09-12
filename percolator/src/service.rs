@@ -9,7 +9,8 @@ labrpc::service! {
     }
 }
 
-pub use timestamp::{add_service as add_tso_service, Client as TSOClient};
+#[allow(unused_imports)]
+pub use timestamp::{add_service as add_tso_service, Client as TsoClient};
 
 labrpc::service! {
     service transaction {
@@ -19,4 +20,5 @@ labrpc::service! {
     }
 }
 
-pub use transaction::{add_service as add_transaction_service, Client as TransactionClient};
+#[allow(unused_imports)]
+pub use transaction::{add_service as add_transaction_service, Client as TxnClient};
